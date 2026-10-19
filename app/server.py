@@ -17,7 +17,14 @@ from pathlib import Path
 from contextlib import asynccontextmanager
 
 import uvicorn
-from fastapi import FastAPI, APIRouter, Request, Response
+from fastapi import (
+    FastAPI,
+    APIRouter,
+    Request,
+    Response,
+    WebSocket,
+    WebSocketDisconnect,
+)
 from fastapi.responses import JSONResponse, HTMLResponse, FileResponse
 
 # ---------------------------------------------------------------------------
@@ -216,6 +223,12 @@ dashboard_app.include_router(dashboard_router)
 #  Frame.io C2C API Emulation
 # ===================================================================
 
+
+@app.get("/health")
+async def health():
+    return {"ok": True}
+
+
 # ---- Authentication (OAuth 2.0 Device Code Grant) -----------------
 
 @app.post("/v2/auth/device/code")
@@ -281,6 +294,61 @@ async def auth_token(request: Request):
 # ---- User / Account stubs ----------------------------------------
 # The camera may call these after pairing to verify the connection.
 
+
+@app.get("/v2/devices/me")
+async def device_me():
+    return {
+        "id": "framedrop-device",
+        "status": "online",
+        "authorization": {"creator": {"name": "framedrop"}},
+        "project": {"name": "framedrop"},
+    }
+
+
+@app.websocket("/devices/websocket")
+async def device_websocket(websocket: WebSocket):
+    authorization = websocket.query_params.get("Authorization", "")
+    scheme, _, token = authorization.partition(" ")
+    if scheme.lower() != "bearer" or token not in tokens:
+        await websocket.close(code=1008)
+        return
+
+    await websocket.accept()
+    try:
+        while True:
+            frame = await websocket.receive()
+            if frame["type"] == "websocket.disconnect":
+                return
+            try:
+                data = frame.get("text")
+                if data is None:
+                    data = frame["bytes"].decode("utf-8")
+                message = json.loads(data)
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                await websocket.close(code=1007)
+                return
+            if not isinstance(message, dict):
+                await websocket.close(code=1003)
+                return
+            topic = message.get("topic")
+            event = message.get("event")
+            if (topic, event) not in {
+                ("devices:framedrop-device", "phx_join"),
+                ("phoenix", "heartbeat"),
+            }:
+                continue
+            await websocket.send_json(
+                {
+                    "topic": topic,
+                    "event": "phx_reply",
+                    "payload": {"status": "ok", "response": {}},
+                    "ref": message.get("ref"),
+                }
+            )
+    except WebSocketDisconnect:
+        pass
+
+
 @app.get("/v2/me")
 async def me():
     return JSONResponse({
@@ -301,6 +369,8 @@ async def account(account_id: str):
 
 # ---- Asset Management --------------------------------------------
 
+
+@app.post("/v2/assets")
 @app.post("/v2/devices/assets")
 async def create_asset(request: Request):
     """Camera creates an asset and receives upload URLs."""
@@ -314,7 +384,13 @@ async def create_asset(request: Request):
 
     # Calculate number of upload parts (cap at 4000 ≈ 100 GB)
     chunk_size = 25 * 1024 * 1024   # 25 MiB per part
-    if filesize and not is_realtime:
+    if "parts" in body:
+        num_parts = body["parts"]
+        if type(num_parts) is not int or not 1 <= num_parts <= 4000:
+            return JSONResponse(
+                {"error": "parts must be between 1 and 4000"}, status_code=400
+            )
+    elif filesize and not is_realtime:
         num_parts = min(4000, max(1, (filesize + chunk_size - 1) // chunk_size))
     else:
         num_parts = 1

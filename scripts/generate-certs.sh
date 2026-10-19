@@ -31,7 +31,9 @@ else
         -sha256 \
         -days 3650 \
         -out "$CERT_DIR/ca.crt" \
-        -subj "/CN=FrameDrop CA"
+        -subj "/CN=FrameDrop CA" \
+        -addext "basicConstraints=critical,CA:TRUE" \
+        -addext "keyUsage=critical,keyCertSign,cRLSign"
 fi
 
 # --- Server certificate for api.frame.io ---
